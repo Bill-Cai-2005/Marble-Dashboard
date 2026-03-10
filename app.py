@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import requests
 import time
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Page configuration
@@ -50,32 +51,48 @@ TICKERS_FILE = DATA_DIR / "nyse_nasdaq_tickers.json"
 UNIVERSAL_CACHE_FILE = DATA_DIR / "universal_cache.json"
 CUSTOM_CACHE_FILE = DATA_DIR / "custom_watchlist_cache.json"
 TICKER_REF_CACHE_FILE = DATA_DIR / "ticker_ref_cache.json"
-WATCHLIST_COLUMNS = ["Ticker", "Current Price", "Market Cap", "Daily Stock Change %", "Volume", "Industry", "Error"]
-NUMERIC_COLUMNS = ["Current Price", "Market Cap", "Daily Stock Change %", "Volume"]
+START_PRICE_CACHE_FILE = DATA_DIR / "start_price_cache.json"
+MARKET_CAP_CACHE_FILE = DATA_DIR / "market_cap_cache.json"
+WATCHLIST_COLUMNS = [
+    "Ticker",
+    "Starting Price",
+    "Current Price",
+    "Market Cap",
+    "Daily Stock Change %",
+    "Change Since Start %",
+    "Volume",
+    "Industry",
+    "Error",
+]
+NUMERIC_COLUMNS = [
+    "Starting Price",
+    "Current Price",
+    "Market Cap",
+    "Daily Stock Change %",
+    "Change Since Start %",
+    "Volume",
+]
+CACHE_LOCK = threading.Lock()
 
 def load_watchlists():
     """Load custom watchlists from JSON file"""
-    if WATCHLISTS_FILE.exists():
-        with open(WATCHLISTS_FILE, 'r') as f:
-            return json.load(f)
-    return {}
+    payload = load_cache(WATCHLISTS_FILE)
+    return payload if isinstance(payload, dict) else {}
 
 def save_watchlists(watchlists):
     """Save custom watchlists to JSON file"""
-    with open(WATCHLISTS_FILE, 'w') as f:
-        json.dump(watchlists, f, indent=2)
+    save_cache(WATCHLISTS_FILE, watchlists)
 
 def load_tickers():
     """Load NYSE and NASDAQ tickers"""
-    if TICKERS_FILE.exists():
-        with open(TICKERS_FILE, 'r') as f:
-            return json.load(f)
+    payload = load_cache(TICKERS_FILE)
+    if isinstance(payload, dict):
+        return payload
     return {"nyse": [], "nasdaq": []}
 
 def save_tickers(tickers):
     """Save NYSE and NASDAQ tickers"""
-    with open(TICKERS_FILE, 'w') as f:
-        json.dump(tickers, f, indent=2)
+    save_cache(TICKERS_FILE, tickers)
 
 def _polygon_get(path, params=None, timeout=20, retries=4):
     q = {} if params is None else dict(params)
@@ -103,14 +120,30 @@ def _to_iso(d):
 
 def load_cache(cache_file):
     if cache_file.exists():
-        with open(cache_file, "r") as f:
-            return json.load(f)
+        with CACHE_LOCK:
+            raw = cache_file.read_text(encoding="utf-8")
+        if not raw.strip():
+            return {}
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            # Recover from concatenated JSON blobs by reading the first object.
+            try:
+                decoder = json.JSONDecoder()
+                obj, _ = decoder.raw_decode(raw)
+                return obj if isinstance(obj, (dict, list)) else {}
+            except Exception:
+                st.warning(f"Cache file is corrupted: {cache_file.name}. Using empty cache.")
+                return {}
     return {}
 
 
 def save_cache(cache_file, payload):
-    with open(cache_file, "w") as f:
-        json.dump(payload, f)
+    tmp_file = cache_file.with_suffix(cache_file.suffix + ".tmp")
+    serialized = json.dumps(payload)
+    with CACHE_LOCK:
+        tmp_file.write_text(serialized, encoding="utf-8")
+        tmp_file.replace(cache_file)
 
 
 def _chunked(seq, size):
@@ -201,6 +234,220 @@ def _save_ref_cache(cache):
     save_cache(TICKER_REF_CACHE_FILE, cache)
 
 
+def _get_start_price_cache():
+    return load_cache(START_PRICE_CACHE_FILE)
+
+
+def _save_start_price_cache(cache):
+    save_cache(START_PRICE_CACHE_FILE, cache)
+
+
+def _get_market_cap_cache():
+    payload = load_cache(MARKET_CAP_CACHE_FILE)
+    return payload if isinstance(payload, dict) else {}
+
+
+def _save_market_cap_cache(payload):
+    save_cache(MARKET_CAP_CACHE_FILE, payload)
+
+
+def _latest_market_cap_snapshot(cache):
+    if not isinstance(cache, dict) or not cache:
+        return None, {}
+    latest_ts = None
+    latest_caps = {}
+    for ts, entry in cache.items():
+        if not isinstance(entry, dict):
+            continue
+        caps = entry.get("market_caps", {})
+        if not isinstance(caps, dict):
+            continue
+        if latest_ts is None or str(ts) > str(latest_ts):
+            latest_ts = ts
+            latest_caps = caps
+    return latest_ts, latest_caps
+
+
+def _apply_market_cap_cache_to_df(df, caps_by_ticker):
+    if df is None or df.empty or not isinstance(caps_by_ticker, dict):
+        return df
+    updated_df = df.copy()
+    fetched_caps = updated_df["Ticker"].map(
+        lambda t: _safe_float(caps_by_ticker.get(str(t).upper())) if pd.notna(t) else None
+    )
+    updated_df["Market Cap"] = fetched_caps.combine_first(updated_df["Market Cap"])
+    return normalize_watchlist_df(updated_df)
+
+
+def _get_start_price_entry(cache, date_key):
+    entry = cache.get(date_key, {}) if isinstance(cache, dict) else {}
+    # Backward-compatible: old format is {date_key: {ticker: price}}
+    if isinstance(entry, dict) and "prices" in entry:
+        prices = entry.get("prices", {})
+        cached_at = entry.get("cached_at")
+    else:
+        prices = entry if isinstance(entry, dict) else {}
+        cached_at = None
+    return prices, cached_at
+
+
+def _set_start_price_entry(cache, date_key, prices):
+    cache[date_key] = {
+        "cached_at": datetime.now().isoformat(),
+        "prices": prices,
+    }
+
+
+def _cached_start_dates():
+    cache = _get_start_price_cache()
+    dates = list(cache.keys()) if isinstance(cache, dict) else []
+    return sorted(dates)
+
+
+def _render_cache_overview():
+    st.subheader("Historical Prices")
+    with st.expander("Show historical price caches"):
+        start_cache = _get_start_price_cache()
+        if isinstance(start_cache, dict) and start_cache:
+            for date_key in sorted(start_cache.keys()):
+                prices, cached_at = _get_start_price_entry(start_cache, date_key)
+                st.markdown(
+                    f"- start date `{date_key}` — cached at: `{cached_at or 'unknown'}` | "
+                    f"tickers: `{len(prices)}`"
+                )
+        else:
+            st.markdown("No historical price caches yet.")
+
+
+def _fetch_first_close_on_or_after(ticker, start_date, lookahead_days=14):
+    to_date = start_date + timedelta(days=lookahead_days)
+    aggs = _polygon_get(
+        f"/v2/aggs/ticker/{ticker}/range/1/day/{_to_iso(start_date)}/{_to_iso(to_date)}",
+        {"adjusted": "true", "sort": "asc", "limit": 50},
+    )
+    rows = aggs.get("results", [])
+    if not rows:
+        return None
+    return _safe_float(rows[0].get("c"))
+
+
+def _fetch_first_open_on_or_after(ticker, start_date, lookahead_days=14):
+    to_date = start_date + timedelta(days=lookahead_days)
+    aggs = _polygon_get(
+        f"/v2/aggs/ticker/{ticker}/range/1/day/{_to_iso(start_date)}/{_to_iso(to_date)}",
+        {"adjusted": "true", "sort": "asc", "limit": 50},
+    )
+    rows = aggs.get("results", [])
+    if not rows:
+        return None
+    return _safe_float(rows[0].get("o"))
+
+
+def _fetch_last_close_on_or_before(ticker, end_date, lookback_days=14):
+    from_date = end_date - timedelta(days=lookback_days)
+    aggs = _polygon_get(
+        f"/v2/aggs/ticker/{ticker}/range/1/day/{_to_iso(from_date)}/{_to_iso(end_date)}",
+        {"adjusted": "true", "sort": "asc", "limit": 50},
+    )
+    rows = aggs.get("results", [])
+    if not rows:
+        return None, None
+    last = rows[-1]
+    return _safe_float(last.get("c")), _safe_float(last.get("v"))
+
+
+def fetch_historical_open_prices_for_date(tickers, selected_date):
+    """Fetch and cache opening prices for all tickers for a selected start date."""
+    date_key = _to_iso(selected_date)
+    cache = _get_start_price_cache()
+    prices, _ = _get_start_price_entry(cache, date_key)
+    prices = dict(prices)
+
+    unique_tickers = list(dict.fromkeys(tickers))
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    total = len(unique_tickers)
+    if total == 0:
+        st.warning("No tickers loaded.")
+        return
+
+    with ThreadPoolExecutor(max_workers=max(4, MAX_WORKERS // 2)) as executor:
+        futures = {
+            executor.submit(_fetch_first_open_on_or_after, t, selected_date): t
+            for t in unique_tickers
+        }
+        completed = 0
+        for future in as_completed(futures):
+            ticker = futures[future]
+            status_text.text(f"Historical open fetch {completed + 1}/{total} ({ticker})")
+            try:
+                open_price = _safe_float(future.result())
+                if open_price is not None:
+                    prices[ticker] = open_price
+            except Exception:
+                pass
+            completed += 1
+            progress_bar.progress(completed / total)
+
+    _set_start_price_entry(cache, date_key, prices)
+    _save_start_price_cache(cache)
+    status_text.text(f"✅ Historical open cache saved for {date_key} ({len(prices)} tickers).")
+    progress_bar.empty()
+
+
+def calculate_market_caps_for_dataframe(df):
+    """Fetch market caps via reference endpoint for tickers currently in the table."""
+    if df is None or df.empty or "Ticker" not in df.columns:
+        st.warning("No table data available to calculate market cap.")
+        return df
+
+    updated_df = df.copy()
+    tickers = [str(t).upper() for t in updated_df["Ticker"].dropna().tolist()]
+    tickers = list(dict.fromkeys(tickers))
+    total = len(tickers)
+    if total == 0:
+        st.warning("No tickers found in table.")
+        return updated_df
+
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    ref_cache = _get_ref_cache()
+    caps_by_ticker = {}
+
+    with ThreadPoolExecutor(max_workers=max(4, MAX_WORKERS // 2)) as executor:
+        futures = {
+            executor.submit(_polygon_get, f"/v3/reference/tickers/{ticker}"): ticker
+            for ticker in tickers
+        }
+        completed = 0
+        for future in as_completed(futures):
+            ticker = futures[future]
+            status_text.text(f"Calculating market cap {completed + 1}/{total} ({ticker})")
+            try:
+                data = future.result()
+                row = data.get("results", {}) if isinstance(data, dict) else {}
+                market_cap = _safe_float(row.get("market_cap"))
+                if market_cap is not None:
+                    caps_by_ticker[ticker] = market_cap
+                if row and _is_individual_company_result(row):
+                    ref_cache[ticker] = _build_ref_cache_entry_from_row(row)
+            except Exception:
+                pass
+            completed += 1
+            progress_bar.progress(completed / total)
+
+    if caps_by_ticker:
+        updated_df = _apply_market_cap_cache_to_df(updated_df, caps_by_ticker)
+
+    _save_ref_cache(ref_cache)
+    cap_cache = _get_market_cap_cache()
+    cap_cache[datetime.now().isoformat()] = {"market_caps": caps_by_ticker}
+    _save_market_cap_cache(cap_cache)
+    status_text.text(f"✅ Market cap calculation complete ({len(caps_by_ticker)}/{total} updated).")
+    progress_bar.empty()
+    return normalize_watchlist_df(updated_df)
+
+
 def refresh_reference_cache_for_tickers(tickers):
     ref_cache = _get_ref_cache()
     progress_bar = st.progress(0)
@@ -228,7 +475,7 @@ def refresh_reference_cache_for_tickers(tickers):
     progress_bar.empty()
 
 
-def _build_snapshot_row(snapshot, ref_cache):
+def _build_snapshot_row(snapshot, ref_cache, start_date_for_change=None, start_price_cache=None):
     ticker = str(snapshot.get("ticker", "")).upper().strip()
     day = snapshot.get("day", {}) or {}
     prev_day = snapshot.get("prevDay", {}) or {}
@@ -249,12 +496,25 @@ def _build_snapshot_row(snapshot, ref_cache):
         elif day_close is not None:
             change_pct = ((day_close - prev_close) / prev_close) * 100
 
+    change_since_start = None
+    starting_price = prev_close
+    if start_date_for_change is not None and isinstance(start_price_cache, dict):
+        date_key = _to_iso(start_date_for_change)
+        prices, _ = _get_start_price_entry(start_price_cache, date_key)
+        cached_start = _safe_float(prices.get(ticker))
+        if cached_start is not None:
+            starting_price = cached_start
+            if current_price is not None and cached_start != 0:
+                change_since_start = ((current_price - cached_start) / cached_start) * 100
+
     ref = ref_cache.get(ticker, {})
     return {
         "Ticker": ticker,
+        "Starting Price": starting_price,
         "Current Price": current_price,
         "Market Cap": _safe_float(ref.get("market_cap")),
         "Daily Stock Change %": change_pct,
+        "Change Since Start %": change_since_start,
         "Volume": volume,
         "Industry": ref.get("industry"),
         "Error": None,
@@ -263,15 +523,15 @@ def _build_snapshot_row(snapshot, ref_cache):
 
 def _daily_change_from_aggs(aggs, custom_start_date=None, custom_end_date=None):
     if not aggs:
-        return None, None
+        return None, None, None, None
     rows = sorted(aggs, key=lambda x: x.get("t", 0))
     if custom_start_date and custom_end_date:
         start_close = _safe_float(rows[0].get("c"))
         end_close = _safe_float(rows[-1].get("c"))
         volume = _safe_float(rows[-1].get("v"))
         if start_close and start_close != 0 and end_close is not None:
-            return ((end_close - start_close) / start_close) * 100, volume
-        return None, volume
+            return start_close, end_close, ((end_close - start_close) / start_close) * 100, volume
+        return start_close, end_close, None, volume
     latest = rows[-1]
     volume = _safe_float(latest.get("v"))
     if len(rows) >= 2:
@@ -279,11 +539,11 @@ def _daily_change_from_aggs(aggs, custom_start_date=None, custom_end_date=None):
         last_close = _safe_float(rows[-1].get("c"))
         if prev_close and prev_close != 0 and last_close is not None:
             # Standard closed-market behavior: second-last close -> last close
-            return ((last_close - prev_close) / prev_close) * 100, volume
-    return None, volume
+            return prev_close, last_close, ((last_close - prev_close) / prev_close) * 100, volume
+    return None, _safe_float(latest.get("c")), None, volume
 
 
-def get_polygon_stock_data(ticker_symbol, custom_start_date=None, custom_end_date=None):
+def get_polygon_stock_data(ticker_symbol, custom_start_date=None, custom_end_date=None, start_price_cache=None):
     try:
         # Use reference cache first; fetch once if missing.
         ref_cache = _get_ref_cache()
@@ -299,6 +559,7 @@ def get_polygon_stock_data(ticker_symbol, custom_start_date=None, custom_end_dat
             _save_ref_cache(ref_cache)
 
         change_pct = None
+        starting_price = None
         current_price = None
         volume = None
         use_custom_range = custom_start_date is not None and custom_end_date is not None
@@ -318,44 +579,66 @@ def get_polygon_stock_data(ticker_symbol, custom_start_date=None, custom_end_dat
             except Exception:
                 pass
 
-        # Custom range or snapshot fallback path.
-        if change_pct is None:
-            from_date = _to_iso(custom_start_date) if custom_start_date else _to_iso(date.today() - timedelta(days=7))
-            to_date = _to_iso(custom_end_date) if custom_end_date else _to_iso(date.today())
+        # Custom range path: cached start price + end/current price.
+        if use_custom_range:
+            date_key = _to_iso(custom_start_date)
+            cached_price = None
+            if isinstance(start_price_cache, dict):
+                prices, _ = _get_start_price_entry(start_price_cache, date_key)
+                cached_price = _safe_float(prices.get(ticker_symbol))
+            starting_price = cached_price if cached_price is not None else _fetch_first_open_on_or_after(
+                ticker_symbol, custom_start_date
+            )
+            current_price, volume = _fetch_last_close_on_or_before(ticker_symbol, custom_end_date)
+            if starting_price and starting_price != 0 and current_price is not None:
+                change_pct = ((current_price - starting_price) / starting_price) * 100
+        # Non-custom fallback path.
+        elif change_pct is None:
+            from_date = _to_iso(date.today() - timedelta(days=7))
+            to_date = _to_iso(date.today())
             aggs = _polygon_get(
                 f"/v2/aggs/ticker/{ticker_symbol}/range/1/day/{from_date}/{to_date}",
                 {"adjusted": "true", "sort": "asc", "limit": 5000},
             )
-            change_pct, volume = _daily_change_from_aggs(
+            starting_price, current_price, change_pct, volume = _daily_change_from_aggs(
                 aggs.get("results", []),
-                custom_start_date=custom_start_date,
-                custom_end_date=custom_end_date,
+                custom_start_date=None,
+                custom_end_date=None,
             )
-            agg_rows = aggs.get("results", [])
-            if agg_rows:
-                current_price = _safe_float(agg_rows[-1].get("c"))
+        else:
+            # Snapshot open-session path already has current price; start is prev close.
+            starting_price = prev_close if 'prev_close' in locals() else None
 
         return {
             "Ticker": ticker_symbol,
+            "Starting Price": starting_price,
             "Current Price": current_price,
             "Market Cap": market_cap,
             "Daily Stock Change %": change_pct,
+            "Change Since Start %": change_pct if use_custom_range else None,
             "Volume": volume,
             "Industry": industry,
         }
     except Exception as e:
         return {
             "Ticker": ticker_symbol,
+            "Starting Price": None,
             "Current Price": None,
             "Market Cap": None,
             "Daily Stock Change %": None,
+            "Change Since Start %": None,
             "Volume": None,
             "Industry": None,
             "Error": str(e),
         }
 
-def get_stock_data(ticker_symbol, custom_start_date=None, custom_end_date=None):
-    return get_polygon_stock_data(ticker_symbol, custom_start_date, custom_end_date)
+def get_stock_data(ticker_symbol, custom_start_date=None, custom_end_date=None, start_price_cache=None):
+    return get_polygon_stock_data(
+        ticker_symbol,
+        custom_start_date,
+        custom_end_date,
+        start_price_cache=start_price_cache,
+    )
 
 def fetch_nyse_nasdaq_tickers():
     """Fetch all active NYSE/NASDAQ tickers from Polygon with pagination."""
@@ -425,7 +708,7 @@ def format_value(value):
     return str(value)
 
 
-def _run_parallel_refresh(tickers, custom_start=None, custom_end=None, min_market_cap=None):
+def _run_parallel_refresh(tickers, custom_start=None, custom_end=None):
     progress_bar = st.progress(0)
     status_text = st.empty()
     total = len(tickers)
@@ -433,10 +716,11 @@ def _run_parallel_refresh(tickers, custom_start=None, custom_end=None, min_marke
     done = 0
     if total == 0:
         return pd.DataFrame([])
+    start_price_cache = _get_start_price_cache() if custom_start and custom_end else None
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = {
-            executor.submit(get_stock_data, t, custom_start, custom_end): t for t in tickers
+            executor.submit(get_stock_data, t, custom_start, custom_end, start_price_cache): t for t in tickers
         }
         for future in as_completed(futures):
             ticker = futures[future]
@@ -445,6 +729,7 @@ def _run_parallel_refresh(tickers, custom_start=None, custom_end=None, min_marke
             except Exception as e:
                 row = {
                     "Ticker": ticker,
+                    "Starting Price": None,
                     "Current Price": None,
                     "Market Cap": None,
                     "Daily Stock Change %": None,
@@ -452,8 +737,7 @@ def _run_parallel_refresh(tickers, custom_start=None, custom_end=None, min_marke
                     "Industry": None,
                     "Error": str(e),
                 }
-            if min_market_cap is None or ((row.get("Market Cap") or 0) >= min_market_cap):
-                results.append(row)
+            results.append(row)
             done += 1
             status_text.text(f"Processed {done}/{total} ({ticker})")
             progress_bar.progress(done / total)
@@ -465,7 +749,7 @@ def _run_parallel_refresh(tickers, custom_start=None, custom_end=None, min_marke
         retry_rows = {}
         with ThreadPoolExecutor(max_workers=max(4, MAX_WORKERS // 2)) as retry_executor:
             retry_futures = {
-                retry_executor.submit(get_stock_data, t, custom_start, custom_end): t
+                retry_executor.submit(get_stock_data, t, custom_start, custom_end, start_price_cache): t
                 for t in failed_tickers
             }
             for retry_future in as_completed(retry_futures):
@@ -475,6 +759,7 @@ def _run_parallel_refresh(tickers, custom_start=None, custom_end=None, min_marke
                 except Exception as e:
                     retry_rows[t] = {
                         "Ticker": t,
+                        "Starting Price": None,
                         "Current Price": None,
                         "Market Cap": None,
                         "Daily Stock Change %": None,
@@ -489,7 +774,7 @@ def _run_parallel_refresh(tickers, custom_start=None, custom_end=None, min_marke
     return normalize_watchlist_df(pd.DataFrame(results))
 
 
-def _refresh_via_snapshot(tickers, min_market_cap=None):
+def _refresh_via_snapshot(tickers, start_date_for_change=None):
     """Fast refresh path for non-custom-date mode using Polygon snapshots."""
     progress_bar = st.progress(0)
     status_text = st.empty()
@@ -498,6 +783,7 @@ def _refresh_via_snapshot(tickers, min_market_cap=None):
         return normalize_watchlist_df(pd.DataFrame([]))
 
     ref_cache = _get_ref_cache()
+    start_price_cache = _get_start_price_cache() if start_date_for_change is not None else None
     rows = []
     processed = 0
     failed = []
@@ -518,25 +804,36 @@ def _refresh_via_snapshot(tickers, min_market_cap=None):
                     rows.append(
                         {
                             "Ticker": t,
+                            "Starting Price": None,
                             "Current Price": None,
                             "Market Cap": _safe_float(ref_cache.get(t, {}).get("market_cap")),
                             "Daily Stock Change %": None,
+                            "Change Since Start %": None,
                             "Volume": None,
                             "Industry": ref_cache.get(t, {}).get("industry"),
                             "Error": "Missing snapshot row",
                         }
                     )
                 else:
-                    rows.append(_build_snapshot_row(snap, ref_cache))
+                    rows.append(
+                        _build_snapshot_row(
+                            snap,
+                            ref_cache,
+                            start_date_for_change=start_date_for_change,
+                            start_price_cache=start_price_cache,
+                        )
+                    )
         except Exception:
             failed.extend(chunk)
             for t in chunk:
                 rows.append(
                     {
                         "Ticker": t,
+                        "Starting Price": None,
                         "Current Price": None,
                         "Market Cap": _safe_float(ref_cache.get(t, {}).get("market_cap")),
                         "Daily Stock Change %": None,
+                        "Change Since Start %": None,
                         "Volume": None,
                         "Industry": ref_cache.get(t, {}).get("industry"),
                         "Error": "Snapshot request failed",
@@ -545,25 +842,13 @@ def _refresh_via_snapshot(tickers, min_market_cap=None):
         processed += len(chunk)
         progress_bar.progress(min(1.0, processed / total))
 
-    # Retry failed/missing with detailed per-ticker path once.
+    # Snapshot-only mode: do not run per-ticker fallback on failed/missing rows.
     if failed:
-        status_text.text(f"Snapshot fallback for {len(failed)} tickers...")
-        fallback_df = _run_parallel_refresh(failed, custom_start=None, custom_end=None, min_market_cap=None)
-        fallback_map = {r["Ticker"]: r for r in fallback_df.to_dict(orient="records")}
-        merged = []
-        for r in rows:
-            if r["Ticker"] in fallback_map:
-                merged.append(fallback_map[r["Ticker"]])
-            else:
-                merged.append(r)
-        rows = merged
+        status_text.text(f"Snapshot complete with {len(failed)} failed/missing tickers (fallback disabled).")
 
     status_text.text("✅ Refresh complete!")
     progress_bar.empty()
-    df = normalize_watchlist_df(pd.DataFrame(rows))
-    if min_market_cap is not None:
-        df = df[(df["Market Cap"].fillna(0) >= min_market_cap)]
-    return df
+    return normalize_watchlist_df(pd.DataFrame(rows))
 
 def main():
     st.title("📊 Marble Watchlist Tool")
@@ -578,11 +863,11 @@ def main():
 
 def universal_watchlist_page():
     st.header("Universal Watchlist")
+    _render_cache_overview()
     
     # Load tickers
     tickers_data = load_tickers()
     all_tickers = tickers_data.get("nyse", []) + tickers_data.get("nasdaq", [])
-    universal_cache = load_cache(UNIVERSAL_CACHE_FILE)
     
     col1, col2, col3, col4 = st.columns([2, 2, 2, 1])
     
@@ -590,14 +875,19 @@ def universal_watchlist_page():
         if st.button("🔄 Fetch NYSE/NASDAQ Tickers"):
             with st.spinner("Fetching tickers from NYSE and NASDAQ..."):
                 tickers_data = fetch_nyse_nasdaq_tickers()
+                tickers_data["fetched_at"] = datetime.now().isoformat()
                 save_tickers(tickers_data)
                 all_tickers = tickers_data.get("nyse", []) + tickers_data.get("nasdaq", [])
                 st.success(f"Loaded {len(all_tickers)} tickers")
     
     with col2:
         use_custom_range = st.checkbox("Use Custom Time Range")
-    with col3:
-        only_500m_plus = st.checkbox("Only Market Cap >= $500M", value=False)
+        historical_cache_date = st.date_input("Historical Price Date (Open)", value=date.today(), key="historical_open_date")
+        if st.button("📚 Historical Price Fetch"):
+            if not all_tickers:
+                st.warning("Please fetch tickers first")
+            else:
+                fetch_historical_open_prices_for_date(all_tickers, historical_cache_date)
     
     custom_start = None
     custom_end = None
@@ -608,21 +898,25 @@ def universal_watchlist_page():
             custom_start = st.date_input("Start Date", value=date.today())
         with col_end:
             custom_end = st.date_input("End Date", value=date.today())
+        cached_dates = _cached_start_dates()
+        if cached_dates:
+            start_cache = _get_start_price_cache()
+            labels = []
+            for d in cached_dates[-12:]:
+                _, ts = _get_start_price_entry(start_cache, d)
+                labels.append(f"{d} (cached {ts or 'unknown'})")
+            st.caption(f"Cached start dates available ({len(cached_dates)}): " + ", ".join(labels))
+        else:
+            st.caption("No cached start dates yet. Use Historical Price Fetch to build cache.")
     
     with col4:
-        if st.button("🧱 Reference Refresh"):
-            if not all_tickers:
-                st.warning("Please fetch tickers first")
-            else:
-                refresh_reference_cache_for_tickers(all_tickers)
-
         if st.button("⚡ Snapshot Refresh"):
             if not all_tickers:
                 st.warning("Please fetch tickers first")
             else:
                 df = _refresh_via_snapshot(
                     all_tickers,
-                    min_market_cap=500_000_000 if only_500m_plus else None,
+                    start_date_for_change=custom_start if use_custom_range else None,
                 )
                 st.session_state.universal_data = df
                 save_cache(
@@ -632,44 +926,66 @@ def universal_watchlist_page():
                         "records": df.to_dict(orient="records"),
                     },
                 )
-
-        if st.button("🔄 Full Refresh"):
-            if not all_tickers:
-                st.warning("Please fetch tickers first")
-            else:
-                refresh_universal_watchlist(
-                    all_tickers,
-                    custom_start,
-                    custom_end,
-                    min_market_cap=500_000_000 if only_500m_plus else None,
-                )
-        if st.button("📂 Load Cached"):
-            records = universal_cache.get("records", [])
-            if records:
-                st.session_state.universal_data = normalize_watchlist_df(pd.DataFrame(records))
-                st.info(f"Loaded {len(records)} cached rows")
-            else:
-                st.warning("No universal cache found yet.")
     
     # Display watchlist
     if 'universal_data' in st.session_state:
         df = st.session_state.universal_data
+        if st.button("🗂️ Load Market Cap From Previous Date"):
+            cap_cache = _get_market_cap_cache()
+            latest_ts, latest_caps = _latest_market_cap_snapshot(cap_cache)
+            if latest_caps:
+                loaded_df = _apply_market_cap_cache_to_df(df, latest_caps)
+                st.session_state.universal_data = loaded_df
+                df = loaded_df
+                st.info(f"Applied market cap cache from {latest_ts}.")
+                save_cache(
+                    UNIVERSAL_CACHE_FILE,
+                    {
+                        "last_refreshed": datetime.now().isoformat(),
+                        "records": loaded_df.to_dict(orient="records"),
+                    },
+                )
+            else:
+                st.warning("No previous market cap cache found.")
+        if st.button("🧮 Calculate Market Cap"):
+            recalculated_df = calculate_market_caps_for_dataframe(df)
+            st.session_state.universal_data = recalculated_df
+            df = recalculated_df
+            save_cache(
+                UNIVERSAL_CACHE_FILE,
+                {
+                    "last_refreshed": datetime.now().isoformat(),
+                    "records": recalculated_df.to_dict(orient="records"),
+                },
+            )
+        # Universal view excludes Industry/Error columns per product requirements.
+        universal_df = df.drop(columns=["Industry", "Error"], errors="ignore")
+        table_min_cap_m = st.number_input(
+            "Table Filter: Min Market Cap (Millions USD)",
+            min_value=0,
+            value=0,
+            step=100,
+            key="universal_table_mcap_filter_m",
+        )
+        if table_min_cap_m > 0:
+            table_min_cap = int(table_min_cap_m) * 1_000_000
+            universal_df = universal_df[universal_df["Market Cap"].fillna(0) >= table_min_cap]
         
         # Sorting
         st.subheader("Sort Options")
         sort_col, sort_order = st.columns(2)
         with sort_col:
-            sort_column = st.selectbox("Sort by", df.columns.tolist(), key="universal_sort_col")
+            sort_column = st.selectbox("Sort by", universal_df.columns.tolist(), key="universal_sort_col")
         with sort_order:
             ascending = st.checkbox("Ascending", value=True, key="universal_sort_order")
         
         if sort_column:
-            df = df.sort_values(by=sort_column, ascending=ascending, na_position='last')
+            universal_df = universal_df.sort_values(by=sort_column, ascending=ascending, na_position='last')
 
-        st.dataframe(df, use_container_width=True, height=600)
+        st.dataframe(universal_df, use_container_width=True, height=600)
         
         # Download button
-        csv = df.to_csv(index=False)
+        csv = universal_df.to_csv(index=False)
         st.download_button(
             label="Download CSV",
             data=csv,
@@ -677,31 +993,23 @@ def universal_watchlist_page():
             mime="text/csv"
         )
 
-def refresh_universal_watchlist(tickers, custom_start=None, custom_end=None, min_market_cap=None):
+def refresh_universal_watchlist(tickers, custom_start=None, custom_end=None):
     """Refresh data for all tickers in universal watchlist"""
     if custom_start or custom_end:
         df = _run_parallel_refresh(
             tickers,
             custom_start=custom_start,
             custom_end=custom_end,
-            min_market_cap=min_market_cap,
         )
     else:
-        df = _refresh_via_snapshot(tickers, min_market_cap=min_market_cap)
+        df = _refresh_via_snapshot(tickers, start_date_for_change=None)
     st.session_state.universal_data = df
-    save_cache(
-        UNIVERSAL_CACHE_FILE,
-        {
-            "last_refreshed": datetime.now().isoformat(),
-            "records": df.to_dict(orient="records"),
-        },
-    )
 
 def custom_watchlists_page():
     st.header("Custom Watchlists")
+    _render_cache_overview()
     
     watchlists = load_watchlists()
-    custom_cache = load_cache(CUSTOM_CACHE_FILE)
     
     # Create new watchlist
     st.subheader("Create New Watchlist")
@@ -740,12 +1048,6 @@ def custom_watchlists_page():
         
         with col2:
             use_custom_range = st.checkbox("Use Custom Time Range", key=f"custom_range_{selected_watchlist}")
-        with col3:
-            only_500m_plus = st.checkbox(
-                "Only Market Cap >= $500M",
-                value=False,
-                key=f"mincap_{selected_watchlist}",
-            )
         
         custom_start = None
         custom_end = None
@@ -766,17 +1068,9 @@ def custom_watchlists_page():
                         tickers,
                         custom_start,
                         custom_end,
-                        min_market_cap=500_000_000 if only_500m_plus else None,
                     )
                 else:
                     st.warning("Watchlist is empty")
-            if st.button("📂 Load Cached", key=f"load_cached_{selected_watchlist}"):
-                records = custom_cache.get(selected_watchlist, {}).get("records", [])
-                if records:
-                    st.session_state[f"watchlist_data_{selected_watchlist}"] = normalize_watchlist_df(pd.DataFrame(records))
-                    st.info(f"Loaded {len(records)} cached rows")
-                else:
-                    st.warning("No cache found for this watchlist.")
         
         # Display tickers in watchlist
         st.subheader(f"Tickers in {selected_watchlist}")
@@ -838,7 +1132,6 @@ def refresh_custom_watchlist(
     tickers,
     custom_start=None,
     custom_end=None,
-    min_market_cap=None,
 ):
     """Refresh data for a specific custom watchlist"""
     if custom_start or custom_end:
@@ -846,17 +1139,10 @@ def refresh_custom_watchlist(
             tickers,
             custom_start=custom_start,
             custom_end=custom_end,
-            min_market_cap=min_market_cap,
         )
     else:
-        df = _refresh_via_snapshot(tickers, min_market_cap=min_market_cap)
+        df = _refresh_via_snapshot(tickers, start_date_for_change=None)
     st.session_state[f"watchlist_data_{watchlist_name}"] = df
-    cache = load_cache(CUSTOM_CACHE_FILE)
-    cache[watchlist_name] = {
-        "last_refreshed": datetime.now().isoformat(),
-        "records": df.to_dict(orient="records"),
-    }
-    save_cache(CUSTOM_CACHE_FILE, cache)
 
 if __name__ == "__main__":
     main()
