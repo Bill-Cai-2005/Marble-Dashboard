@@ -1,13 +1,19 @@
 import streamlit as st
+from dotenv import load_dotenv
 import pandas as pd
 from datetime import datetime, date, timedelta
 import json
+import yfinance as yf
 import os
 from pathlib import Path
 import requests
 import time
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+load_dotenv('.env.local')
+
+api_key = os.getenv("POLYGON_API_KEY")
 
 # Page configuration
 st.set_page_config(
@@ -690,6 +696,92 @@ def fetch_nyse_nasdaq_tickers():
     )
     return {"nyse": nyse_tickers, "nasdaq": nasdaq_tickers}
 
+def display_stock_news_inline(ticker):
+    """Fetches and displays news from the last 72 hours using Polygon news API."""
+    st.markdown(f"### 📰 Recent Market Intelligence: {ticker}")
+    try:
+        cutoff = datetime.now() - timedelta(hours=72)
+        cutoff_str = cutoff.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        data = _polygon_get(
+            "/v2/reference/news",
+            {
+                "ticker": ticker,
+                "published_utc.gte": cutoff_str,
+                "order": "desc",
+                "limit": 10,
+                "sort": "published_utc",
+            },
+        )
+
+        articles = data.get("results", [])
+
+        if not articles:
+            st.info(f"No significant news found for {ticker} in the last 72 hours.")
+            return
+
+        if st.toggle("📰 Show Sources", key=f"news_toggle_{ticker}"):
+            for item in articles:
+                with st.container(border=True):
+                    col_a, col_b = st.columns([0.8, 0.2])
+                    with col_a:
+                        st.write(f"**{item.get('title', 'No title')}**")
+                        published = item.get("published_utc", "")
+                        publisher = item.get("publisher", {}).get("name", "Unknown")
+                        if published:
+                            try:
+                                pub_dt = datetime.strptime(published[:19], "%Y-%m-%dT%H:%M:%S")
+                                published = pub_dt.strftime("%Y-%m-%d %H:%M")
+                            except Exception:
+                                pass
+                        st.caption(f"Source: {publisher} | {published}")
+                        desc = item.get("description", "")
+                        if desc:
+                            st.write(desc[:200] + "..." if len(desc) > 200 else desc)
+                    with col_b:
+                        article_url = item.get("article_url", "")
+                        if article_url:
+                            st.link_button("Read article", article_url, use_container_width=True)
+
+    except Exception as e:
+        st.error(f"Error fetching news for {ticker}: {e}")
+
+def display_company_summary(ticker):
+    """Display company summary using yfinance."""
+    try:
+        stock = yf.Ticker(ticker)
+        info = stock.info
+
+        summary = info.get("longBusinessSummary")
+        long_name = info.get("longName", ticker)
+        sector = info.get("sector", "")
+        industry = info.get("industry", "")
+        country = info.get("country", "")
+        employees = info.get("fullTimeEmployees")
+        website = info.get("website", "")
+
+        if summary:
+            st.markdown(f"**{long_name}**")
+            meta = ""
+            if sector or industry:
+                meta += f"📌 {sector} — {industry}"
+            if country:
+                meta += f" | 🌍 {country}"
+            if employees:
+                meta += f" | 👥 {employees:,} employees"
+            if website:
+                meta += f" | 🌐 {website}"
+            if meta:
+                st.caption(meta)
+            st.write(summary)
+        else:
+            st.info(f"No company summary available for {ticker}.")
+
+    except Exception as e:
+        st.error(f"Could not load company summary for {ticker}: {e}")
+
+
+
 def format_value(value):
     """Format numeric values for display"""
     if value is None:
@@ -981,10 +1073,38 @@ def universal_watchlist_page():
         
         if sort_column:
             universal_df = universal_df.sort_values(by=sort_column, ascending=ascending, na_position='last')
+            # 1. Ensure the index is reset so the selection ID matches the row ID
+        display_df = universal_df.reset_index(drop=True)
 
-        st.dataframe(universal_df, use_container_width=True, height=600)
-        
-        # Download button
+        # 2. Show the Interactive Table
+        event = st.dataframe(
+            display_df, 
+            use_container_width=True, 
+            height=400, 
+            on_select="rerun",
+            selection_mode="single-row",
+            key="universal_selection_key"
+        )
+
+        # 3. Handle the selection
+        if event and event.selection.rows:
+            selected_row_idx = event.selection.rows
+    
+            # FIX: extract scalar from list
+            selected_ticker = display_df.iloc[selected_row_idx[0]]["Ticker"]
+    
+            st.divider()
+    
+            with st.container(border=True):
+                st.subheader(f"Company Summary: {selected_ticker}")
+                display_company_summary(selected_ticker)
+                st.markdown("---")
+                display_stock_news_inline(selected_ticker)
+        else:
+            st.info("Click a row in the table to view the AI Summary and News.")
+        st.divider()
+
+        # Download button remains at the bottom
         csv = universal_df.to_csv(index=False)
         st.download_button(
             label="Download CSV",
